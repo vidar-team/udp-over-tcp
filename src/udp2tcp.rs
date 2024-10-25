@@ -1,14 +1,12 @@
 //! Primitives for listening on UDP and forwarding the data in incoming datagrams
 //! to a TCP stream.
 
+use super::tcp_pool::TcpPool;
 use crate::logging::Redact;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use tokio::net::{TcpSocket, UdpSocket};
-
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use tokio::net::UdpSocket;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -57,7 +55,7 @@ impl std::error::Error for Error {
 
 /// Struct allowing listening on UDP and forwarding the traffic over TCP.
 pub struct Udp2Tcp {
-    tcp_socket: TcpSocket,
+    tcp_pool: TcpPool,
     udp_socket: UdpSocket,
     tcp_forward_addr: SocketAddr,
     tcp_options: crate::TcpOptions,
@@ -70,14 +68,9 @@ impl Udp2Tcp {
         udp_listen_addr: SocketAddr,
         tcp_forward_addr: SocketAddr,
         tcp_options: crate::TcpOptions,
+        tcp_pool_size: Option<usize>,
     ) -> Result<Self, Error> {
-        let tcp_socket = match &tcp_forward_addr {
-            SocketAddr::V4(..) => TcpSocket::new_v4(),
-            SocketAddr::V6(..) => TcpSocket::new_v6(),
-        }
-        .map_err(Error::CreateTcpSocket)?;
-
-        crate::tcp_options::apply(&tcp_socket, &tcp_options).map_err(Error::ApplyTcpOptions)?;
+        let tcp_pool = TcpPool::new(&tcp_forward_addr, &tcp_options, tcp_pool_size.unwrap_or(1))?;
 
         let udp_socket = UdpSocket::bind(udp_listen_addr)
             .await
@@ -88,7 +81,7 @@ impl Udp2Tcp {
         }
 
         Ok(Self {
-            tcp_socket,
+            tcp_pool,
             udp_socket,
             tcp_forward_addr,
             tcp_options,
@@ -101,12 +94,6 @@ impl Udp2Tcp {
     /// pick a random port. Then this method will return the actual port it is now bound to.
     pub fn local_udp_addr(&self) -> io::Result<SocketAddr> {
         self.udp_socket.local_addr()
-    }
-
-    /// Returns the raw file descriptor for the TCP socket that datagrams are forwarded to.
-    #[cfg(unix)]
-    pub fn remote_tcp_fd(&self) -> RawFd {
-        self.tcp_socket.as_raw_fd()
     }
 
     /// Connects to the TCP address and runs the forwarding until the TCP socket is closed, or
@@ -122,15 +109,10 @@ impl Udp2Tcp {
         log::info!("Incoming connection from {}/UDP", Redact(udp_peer_addr));
 
         log::info!("Connecting to {}/TCP", self.tcp_forward_addr);
-        let tcp_stream = self
-            .tcp_socket
-            .connect(self.tcp_forward_addr)
-            .await
-            .map_err(Error::ConnectTcp)?;
+        let tcp_stream = self.tcp_pool.connect(self.tcp_forward_addr).await?;
         log::info!("Connected to {}/TCP", self.tcp_forward_addr);
 
-        crate::tcp_options::set_nodelay(&tcp_stream, self.tcp_options.nodelay)
-            .map_err(Error::ApplyTcpOptions)?;
+        tcp_stream.set_nodelay(self.tcp_options.nodelay)?;
 
         // Connect the UDP socket to whoever sent the first datagram. This is where
         // all the returned traffic will be sent to.
