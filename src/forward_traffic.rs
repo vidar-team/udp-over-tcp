@@ -1,3 +1,4 @@
+use crate::tcp_pool_client::TcpPoolClient;
 use crate::NeverOkResult;
 use err_context::BoxedErrorExt as _;
 use err_context::ResultExt as _;
@@ -33,15 +34,14 @@ pub async fn process_udp_over_tcp(
 ) {
     let udp_in = Arc::new(udp_socket);
     let udp_out = udp_in.clone();
-    let (tcp_in, tcp_out) = tcp_stream.into_split();
 
     let tcp2udp = async move {
-        if let Err(error) = process_tcp2udp(tcp_in, udp_out, tcp_recv_timeout).await {
+        if let Err(error) = process_tcp2udp(tcp_pool, udp_out, tcp_recv_timeout).await {
             log::error!("Error: {}", error.display("\nCaused by: "));
         }
     };
     let udp2tcp = async move {
-        let error = process_udp2tcp(udp_in, tcp_out).await.into_error();
+        let error = process_udp2tcp(udp_in, tcp_pool).await.into_error();
         log::error!("Error: {}", error.display("\nCaused by: "));
     };
 
@@ -134,7 +134,7 @@ fn split_first_datagram(buffer: &[u8]) -> Option<(&[u8], &[u8])> {
 /// to `tcp_out` indefinitely, or until an IO error happens on either socket.
 async fn process_udp2tcp(
     udp_in: Arc<UdpSocket>,
-    mut tcp_out: TcpWriteHalf,
+    tcp_pool: &TcpPoolClient,
 ) -> Result<Infallible, Box<dyn std::error::Error>> {
     // A buffer large enough to hold any possible UDP datagram plus its 16 bit length header.
     let mut buffer = datagram_buffer();
@@ -149,7 +149,7 @@ async fn process_udp2tcp(
             u16::try_from(udp_read_len).expect("UDP datagram can't be larger than 2^16");
         buffer[..HEADER_LEN].copy_from_slice(&datagram_len.to_be_bytes()[..]);
 
-        tcp_out
+        tcp_pool
             .write_all(&buffer[..HEADER_LEN + udp_read_len])
             .await
             .context("Failed writing to TCP")?;

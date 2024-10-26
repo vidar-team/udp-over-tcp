@@ -90,7 +90,8 @@ mod exponential_backoff;
 mod forward_traffic;
 mod logging;
 mod tcp_options;
-mod tcp_pool;
+mod tcp_pool_client;
+mod tcp_pool_server;
 
 pub use tcp_options::{ApplyTcpOptionsError, ApplyTcpOptionsErrorKind, TcpOptions};
 

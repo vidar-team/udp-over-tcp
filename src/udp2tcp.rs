@@ -1,7 +1,7 @@
 //! Primitives for listening on UDP and forwarding the data in incoming datagrams
 //! to a TCP stream.
 
-use super::tcp_pool::TcpPool;
+use super::tcp_pool_client::TcpPoolClient;
 use crate::logging::Redact;
 use std::fmt;
 use std::io;
@@ -55,7 +55,7 @@ impl std::error::Error for Error {
 
 /// Struct allowing listening on UDP and forwarding the traffic over TCP.
 pub struct Udp2Tcp {
-    tcp_pool: TcpPool,
+    tcp_pool: TcpPoolClient,
     udp_socket: UdpSocket,
     tcp_forward_addr: SocketAddr,
     tcp_options: crate::TcpOptions,
@@ -70,7 +70,7 @@ impl Udp2Tcp {
         tcp_options: crate::TcpOptions,
         tcp_pool_size: Option<usize>,
     ) -> Result<Self, Error> {
-        let tcp_pool = TcpPool::new(&tcp_forward_addr, &tcp_options, tcp_pool_size.unwrap_or(1))?;
+        let tcp_pool = TcpPoolClient::new(tcp_pool_size.unwrap_or(1), &tcp_forward_addr, &tcp_options)?;
 
         let udp_socket = UdpSocket::bind(udp_listen_addr)
             .await
@@ -98,7 +98,7 @@ impl Udp2Tcp {
 
     /// Connects to the TCP address and runs the forwarding until the TCP socket is closed, or
     /// an error occur.
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(mut self) -> Result<(), Error> {
         // Wait for the first datagram, to get the UDP peer_addr to connect to.
         let mut tmp_buffer = crate::forward_traffic::datagram_buffer();
         let (_udp_read_len, udp_peer_addr) = self
@@ -109,10 +109,8 @@ impl Udp2Tcp {
         log::info!("Incoming connection from {}/UDP", Redact(udp_peer_addr));
 
         log::info!("Connecting to {}/TCP", self.tcp_forward_addr);
-        let tcp_stream = self.tcp_pool.connect(self.tcp_forward_addr).await?;
+        self.tcp_pool.connect().await?;
         log::info!("Connected to {}/TCP", self.tcp_forward_addr);
-
-        tcp_stream.set_nodelay(self.tcp_options.nodelay)?;
 
         // Connect the UDP socket to whoever sent the first datagram. This is where
         // all the returned traffic will be sent to.
@@ -123,7 +121,7 @@ impl Udp2Tcp {
 
         crate::forward_traffic::process_udp_over_tcp(
             self.udp_socket,
-            tcp_stream,
+            &mut self.tcp_pool,
             self.tcp_options.recv_timeout,
         )
         .await;
