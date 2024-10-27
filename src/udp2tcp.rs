@@ -70,7 +70,8 @@ impl Udp2Tcp {
         tcp_options: crate::TcpOptions,
         tcp_pool_size: Option<usize>,
     ) -> Result<Self, Error> {
-        let tcp_pool = TcpPoolClient::new(tcp_pool_size.unwrap_or(1), &tcp_forward_addr, &tcp_options)?;
+        let tcp_pool =
+            TcpPoolClient::new(tcp_pool_size.unwrap_or(1), &tcp_forward_addr, &tcp_options);
 
         let udp_socket = UdpSocket::bind(udp_listen_addr)
             .await

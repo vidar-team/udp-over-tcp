@@ -54,9 +54,9 @@ pub async fn process_udp_over_tcp(
 
 /// Reads from `tcp_in` and extracts UDP datagrams. Writes the datagrams to `udp_out`.
 /// Returns if the TCP socket is closed, or an IO error happens on either socket.
-async fn process_tcp2udp(
+pub async fn process_tcp2udp(
     mut tcp_in: TcpReadHalf,
-    udp_out: Arc<UdpSocket>,
+    sender: &mpsc::Sender<Vec<u8>>,
     tcp_recv_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = datagram_buffer();
@@ -73,9 +73,10 @@ async fn process_tcp2udp(
         }
         unprocessed_i += tcp_read_len;
 
-        let processed_i = forward_datagrams_in_buffer(&udp_out, &buffer[..unprocessed_i])
+        let processed_i = forward_datagrams_in_buffer(sender, &buffer[..unprocessed_i])
             .await
-            .context("Failed writing to UDP")?;
+            .context("Failed connecting to Channel")
+            .unwrap();
 
         // If we have read data that was not forwarded, because it was not a complete datagram,
         // move it to the start of the buffer and start over
@@ -100,7 +101,10 @@ async fn maybe_timeout<F: Future>(
 
 /// Forward all complete datagrams in `buffer` to `udp_out`.
 /// Returns the number of processed bytes.
-async fn forward_datagrams_in_buffer(udp_out: &UdpSocket, buffer: &[u8]) -> io::Result<usize> {
+async fn forward_datagrams_in_buffer(
+    sender: &mpsc::Sender<Vec<u8>>,
+    buffer: &[u8],
+) -> Result<usize, TrySendError<()>> {
     let mut unprocessed_buffer = buffer;
     loop {
         let Some((datagram_data, tail)) = split_first_datagram(unprocessed_buffer) else {
@@ -108,13 +112,14 @@ async fn forward_datagrams_in_buffer(udp_out: &UdpSocket, buffer: &[u8]) -> io::
             break Ok(buffer.len() - unprocessed_buffer.len());
         };
 
-        let udp_write_len = udp_out.send(datagram_data).await?;
-        assert_eq!(
-            udp_write_len,
-            datagram_data.len(),
-            "Did not send entire UDP datagram"
-        );
-        log::trace!("Forwarded {} bytes TCP->UDP", datagram_data.len());
+        sender.try_send(datagram_data.to_vec()).map_or_else(
+            |e| match e {
+                TrySendError::Full(_) => Ok(()),
+                TrySendError::Closed(_) => Err(TrySendError::Closed(())),
+            },
+            |_| Ok(()),
+        )?;
+        log::trace!("Forwarded {} bytes TCP->Channel", datagram_data.len());
 
         unprocessed_buffer = tail;
     }
