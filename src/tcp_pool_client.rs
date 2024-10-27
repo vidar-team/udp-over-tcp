@@ -1,3 +1,4 @@
+use crate::tcp_pool::TcpPool;
 use crate::udp2tcp::Error;
 
 use super::forward_traffic::process_tcp2udp;
@@ -21,6 +22,12 @@ pub struct TcpPoolClient {
     writer_counter: AtomicUsize,
     write_streams: Vec<Arc<Mutex<OwnedWriteHalf>>>,
     read_channel: Option<RefCell<mpsc::Receiver<Vec<u8>>>>,
+}
+
+pub struct TcpPoolClientWriteHalf {
+    size: usize,
+    writer_counter: AtomicUsize,
+    write_streams: Vec<Arc<Mutex<OwnedWriteHalf>>>,
 }
 
 impl TcpPoolClient {
@@ -71,22 +78,6 @@ impl TcpPoolClient {
         Ok(tcp_stream)
     }
 
-    pub async fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        // try all streams times
-        for _ in 0..self.size {
-            let selected = self.writer_counter.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut write_stream) = self.write_streams[selected % self.size].try_lock() {
-                write_stream.write_all(buf).await.map_err(|e| {
-                    // todo: notify daemon thread to reconnect the stream
-                    e
-                })?;
-                return Ok(());
-            }
-        }
-        // too many packets to send just drop packet
-        Ok(())
-    }
-
     pub async fn read(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         if let Some(rx_cell) = self.read_channel.as_ref() {
             let mut rx = rx_cell.borrow_mut();
@@ -100,3 +91,22 @@ impl TcpPoolClient {
         }
     }
 }
+
+impl TcpPool for TcpPoolClient {
+    async fn write_all(&self, buf: Vec<u8>) -> io::Result<()> {
+        // try all streams times
+        for _ in 0..self.size {
+            let selected = self.writer_counter.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut write_stream) = self.write_streams[selected % self.size].try_lock() {
+                write_stream.write_all(buf.as_slice()).await.map_err(|e| {
+                    // todo: notify daemon thread to reconnect the stream
+                    e
+                })?;
+                return Ok(());
+            }
+        }
+        // too many packets to send just drop packet
+        Ok(())
+    }
+}
+

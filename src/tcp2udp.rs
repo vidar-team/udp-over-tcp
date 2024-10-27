@@ -2,12 +2,15 @@
 //! to UDP.
 
 use crate::exponential_backoff::ExponentialBackoff;
+use crate::forward_traffic::process_udp2tcp;
 use crate::logging::Redact;
+use crate::tcp_pool_server::TcpPoolServer;
 use err_context::{BoxedErrorExt as _, ErrorExt as _, ResultExt as _};
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::os::windows::process;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
@@ -153,42 +156,16 @@ pub async fn run(options: Options) -> Result<Infallible, Tcp2UdpError> {
         }
     });
 
-    #[cfg(not(feature = "statsd"))]
-    let statsd = Arc::new(statsd::StatsdMetrics::dummy());
-    #[cfg(feature = "statsd")]
-    let statsd = Arc::new(match options.statsd_host {
-        None => statsd::StatsdMetrics::dummy(),
-        Some(statsd_host) => {
-            statsd::StatsdMetrics::real(statsd_host).map_err(Tcp2UdpError::CreateStatsdClient)?
-        }
-    });
+    let pool = TcpPoolServer::new(options.tcp_listen_addrs, options.tcp_options);
+    pool.run()?;
 
-    let mut join_handles = Vec::with_capacity(options.tcp_listen_addrs.len());
-    for tcp_listen_addr in options.tcp_listen_addrs {
-        let tcp_listener = create_listening_socket(tcp_listen_addr, &options.tcp_options)?;
-        log::info!("Listening on {}/TCP", tcp_listener.local_addr().unwrap());
-
-        let udp_forward_addr = options.udp_forward_addr;
-        let tcp_recv_timeout = options.tcp_options.recv_timeout;
-        let tcp_nodelay = options.tcp_options.nodelay;
-        let statsd = Arc::clone(&statsd);
-        join_handles.push(tokio::spawn(async move {
-            process_tcp_listener(
-                tcp_listener,
-                udp_bind_ip,
-                udp_forward_addr,
-                tcp_recv_timeout,
-                tcp_nodelay,
-                statsd,
-            )
-            .await;
-        }));
+    if let Err(err) = process_socket(&pool, udp_bind_ip, options.udp_forward_addr).await{
+        log::error!("Error: {}", err.display("\nCaused by: "));
     }
-    futures::future::join_all(join_handles).await;
     unreachable!("Listening TCP sockets never exit");
 }
 
-fn create_listening_socket(
+pub fn create_listening_socket(
     addr: SocketAddr,
     options: &crate::tcp_options::TcpOptions,
 ) -> Result<TcpListener, Tcp2UdpError> {
@@ -211,65 +188,13 @@ fn create_listening_socket(
     Ok(tcp_listener)
 }
 
-async fn process_tcp_listener(
-    tcp_listener: TcpListener,
-    udp_bind_ip: IpAddr,
-    udp_forward_addr: SocketAddr,
-    tcp_recv_timeout: Option<Duration>,
-    tcp_nodelay: bool,
-    statsd: Arc<statsd::StatsdMetrics>,
-) -> ! {
-    let mut cooldown =
-        ExponentialBackoff::new(Duration::from_millis(50), Duration::from_millis(5000));
-    loop {
-        match tcp_listener.accept().await {
-            Ok((tcp_stream, tcp_peer_addr)) => {
-                log::debug!("Incoming connection from {}/TCP", Redact(tcp_peer_addr));
-                if let Err(error) = crate::tcp_options::set_nodelay(&tcp_stream, tcp_nodelay) {
-                    log::error!("Error: {}", error.display("\nCaused by: "));
-                }
-                let statsd = statsd.clone();
-                tokio::spawn(async move {
-                    statsd.incr_connections();
-                    if let Err(error) = process_socket(
-                        tcp_stream,
-                        tcp_peer_addr,
-                        udp_bind_ip,
-                        udp_forward_addr,
-                        tcp_recv_timeout,
-                    )
-                    .await
-                    {
-                        log::error!("Error: {}", error.display("\nCaused by: "));
-                    }
-                    statsd.decr_connections();
-                });
-                cooldown.reset();
-            }
-            Err(error) => {
-                log::error!("Error when accepting incoming TCP connection: {}", error);
-
-                statsd.accept_error();
-
-                // If the process runs out of file descriptors, it will fail to accept a socket.
-                // But that socket will also remain in the queue, so it will fail again immediately.
-                // This will busy loop consuming the CPU and filling any logs. To prevent this,
-                // delay between failed socket accept operations.
-                sleep(cooldown.next_delay()).await;
-            }
-        }
-    }
-}
-
 /// Sets up a UDP socket bound to `udp_bind_ip` and connected to `udp_peer_addr` and forwards
 /// traffic between that UDP socket and the given `tcp_stream` until the `tcp_stream` is closed.
 /// `tcp_peer_addr` should be the remote addr that `tcp_stream` is connected to.
 async fn process_socket(
-    tcp_stream: TcpStream,
-    tcp_peer_addr: SocketAddr,
+    tcp_pool: &TcpPoolServer,
     udp_bind_ip: IpAddr,
     udp_peer_addr: SocketAddr,
-    tcp_recv_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let udp_bind_addr = SocketAddr::new(udp_bind_ip, 0);
 
@@ -292,12 +217,6 @@ async fn process_socket(
         udp_peer_addr
     );
 
-    crate::forward_traffic::process_udp_over_tcp(udp_socket, tcp_stream, tcp_recv_timeout).await;
-    log::debug!(
-        "Closing forwarding for {}/TCP <-> {}/UDP",
-        Redact(tcp_peer_addr),
-        udp_peer_addr
-    );
-
+    process_udp2tcp( &udp_socket,tcp_pool).await;
     Ok(())
 }

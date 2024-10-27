@@ -1,11 +1,16 @@
 //! Primitives for listening on UDP and forwarding the data in incoming datagrams
 //! to a TCP stream.
 
+use super::forward_traffic::process_udp2tcp;
 use super::tcp_pool_client::TcpPoolClient;
 use crate::logging::Redact;
+use crate::tcp_pool;
+use futures::future::select;
+use futures::pin_mut;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 #[derive(Debug)]
@@ -120,12 +125,28 @@ impl Udp2Tcp {
             .await
             .map_err(Error::ConnectUdp)?;
 
-        crate::forward_traffic::process_udp_over_tcp(
-            self.udp_socket,
-            &mut self.tcp_pool,
-            self.tcp_options.recv_timeout,
-        )
-        .await;
+        // tcp2udp
+        tokio::spawn(async {
+            loop {
+                match self.tcp_pool.read().await {
+                    Ok(data) => {
+                        if let Err(error) = self.udp_socket.send(&data).await {
+                            log::error!("Error: {}", error);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Error: {}", e);
+                        break;
+                    }
+                }
+            }
+            return;
+        });
+
+        // udp2tcp
+        process_udp2tcp(&self.udp_socket, &self.tcp_pool).await;
+
         log::debug!(
             "Closing forwarding for {}/UDP <-> {}/TCP",
             Redact(udp_peer_addr),

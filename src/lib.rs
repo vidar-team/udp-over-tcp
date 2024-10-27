@@ -92,6 +92,7 @@ mod logging;
 mod tcp_options;
 mod tcp_pool_client;
 mod tcp_pool_server;
+mod tcp_pool;
 
 pub use tcp_options::{ApplyTcpOptionsError, ApplyTcpOptionsErrorKind, TcpOptions};
 
