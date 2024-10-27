@@ -42,6 +42,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         options.udp_listen_addr,
         options.tcp_forward_addr,
         options.tcp_options,
+        1
     )
     .await?;
     udp2tcp.run().await?;

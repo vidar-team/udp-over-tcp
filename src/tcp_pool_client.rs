@@ -1,10 +1,12 @@
-use super::udp2tcp::Error;
+use crate::udp2tcp::Error;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use tokio::io::AsyncWriteExt;
+use std::vec;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::{
     io::{self},
     net::{
@@ -19,8 +21,9 @@ pub struct TcpPoolClient {
     tcp_option: crate::TcpOptions,
     reader_counter: AtomicUsize,
     writer_counter: AtomicUsize,
-    read_streams: Vec<Arc<Mutex<OwnedReadHalf>>>,
+    read_streams: Vec<Arc<Mutex<BufReader<OwnedReadHalf>>>>,
     write_streams: Vec<Arc<Mutex<OwnedWriteHalf>>>,
+    read_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl TcpPoolClient {
@@ -37,6 +40,7 @@ impl TcpPoolClient {
             writer_counter: AtomicUsize::new(0),
             read_streams: Vec::with_capacity(size),
             write_streams: Vec::with_capacity(size),
+            read_queue: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -44,7 +48,8 @@ impl TcpPoolClient {
         for _ in 0..self.size {
             let tcp_stream = self.connect_one().await?;
             let (read_stream, write_stream) = tcp_stream.into_split();
-            self.read_streams.push(Arc::new(Mutex::new(read_stream)));
+            self.read_streams
+                .push(Arc::new(Mutex::new(BufReader::new(read_stream))));
             self.write_streams.push(Arc::new(Mutex::new(write_stream)));
         }
         Ok(())
@@ -68,7 +73,7 @@ impl TcpPoolClient {
         // try all streams times
         for _ in 0..self.size {
             let selected = self.writer_counter.fetch_add(1, Ordering::SeqCst);
-            if let Ok(mut write_stream) =  self.write_streams[selected % self.size].try_lock() {
+            if let Ok(mut write_stream) = self.write_streams[selected % self.size].try_lock() {
                 write_stream.write_all(buf).await.map_err(|e| {
                     // todo: notify daemon thread to reconnect the stream
                     e
@@ -79,8 +84,21 @@ impl TcpPoolClient {
         Ok(())
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // todo: maybe many thread for reading from all streams?
-        panic!("not implemented")
+    pub fn run_read(&self) {
+        for index in 0..self.size {
+            self.read_one(index);
+        }
+    }
+
+    pub async fn read_one(&self, index: usize) {
+        loop {
+            let mut read_stream = self.read_streams[index].lock().unwrap();
+            loop {
+                let size = read_stream.read_u32().await.unwrap();
+                let mut buf = vec![0u8; size as usize];
+                read_stream.read_exact(&mut buf).await.unwrap();
+                self.read_queue.lock().unwrap().push_back(buf);
+            }
+        }
     }
 }
